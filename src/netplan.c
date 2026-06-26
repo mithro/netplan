@@ -970,6 +970,20 @@ err_path:
     // LCOV_EXCL_STOP
 }
 
+/* fsync the directory containing @filepath so that a rename into it is durable
+ * across power loss. Best-effort: a failure here does not invalidate the file
+ * content that was already fsync'd and atomically renamed into place. */
+STATIC void
+_netplan_fsync_dir(const char* filepath)
+{
+    g_autofree char* dir = g_path_get_dirname(filepath);
+    int dfd = open(dir, O_RDONLY);
+    if (dfd >= 0) {
+        fsync(dfd);
+        close(dfd);
+    }
+}
+
 gboolean
 netplan_netdef_write_yaml(
         const NetplanState* np_state,
@@ -979,7 +993,10 @@ netplan_netdef_write_yaml(
 {
     g_autofree gchar *filename = NULL;
     g_autofree gchar *path = NULL;
+    g_autofree gchar *tmp_path = NULL;
     mode_t orig_umask;
+    int out_fd = -1;
+    FILE *output = NULL;
 
     /* NetworkManager produces one file per connection profile
     * It's 90-* to be higher priority than the default 70-netplan-set.yaml */
@@ -995,9 +1012,26 @@ netplan_netdef_write_yaml(
     yaml_event_t event_data;
     yaml_emitter_t* emitter = &emitter_data;
     yaml_event_t* event = &event_data;
+
+    /* Render to a temporary file and atomically rename it into place. An
+     * interrupted write (power loss, reboot, SIGKILL) can then never leave a
+     * truncated/0-byte YAML behind: the data is fsync'd before the rename, and
+     * the directory is fsync'd afterwards for durability. */
+    tmp_path = g_strdup_printf("%s.XXXXXX", path);
     orig_umask = umask(077); // owner (root) read-only
-    FILE *output = fopen(path, "wb");
+    out_fd = mkstemp(tmp_path); // permissions 0600 by default
     umask(orig_umask);
+    if (out_fd < 0) {
+        g_set_error(error, NETPLAN_FILE_ERROR, errno, "%m");
+        return FALSE;
+    }
+    output = fdopen(out_fd, "wb");
+    if (!output) {
+        g_set_error(error, NETPLAN_FILE_ERROR, errno, "%m");
+        close(out_fd);
+        unlink(tmp_path);
+        return FALSE;
+    }
 
     YAML_OUT_START(event, emitter, output);
     /* build the netplan boilerplate YAML structure */
@@ -1017,14 +1051,33 @@ netplan_netdef_write_yaml(
 
     /* Tear down the YAML emitter */
     YAML_OUT_STOP(event, emitter);
-    fclose(output);
+
+    /* Flush libc buffers and force the data to stable storage before rename. */
+    if (fflush(output) != 0 || fsync(fileno(output)) != 0) {
+        g_set_error(error, NETPLAN_FILE_ERROR, errno, "%m");
+        fclose(output);
+        unlink(tmp_path);
+        return FALSE;
+    }
+    fclose(output); // also closes out_fd
+    output = NULL;
+
+    if (rename(tmp_path, path) != 0) {
+        g_set_error(error, NETPLAN_FILE_ERROR, errno, "%m");
+        unlink(tmp_path);
+        return FALSE;
+    }
+    _netplan_fsync_dir(path);
     return TRUE;
 
     // LCOV_EXCL_START
 err_path:
     g_set_error(error, NETPLAN_EMITTER_ERROR, NETPLAN_ERROR_YAML_EMITTER, "Error generating YAML: %s", emitter->problem);
     yaml_emitter_delete(emitter);
-    fclose(output);
+    if (output)
+        fclose(output);
+    if (tmp_path)
+        unlink(tmp_path);
     return FALSE;
     // LCOV_EXCL_STOP
 }
@@ -1187,10 +1240,17 @@ netplan_state_write_yaml_file(const NetplanState* np_state, const char* filename
 
     gboolean ret = netplan_netdef_list_write_yaml(np_state, to_write, out_fd, path, TRUE, error);
     g_list_free(to_write);
+    /* Force the data to stable storage before the atomic rename. */
+    if (ret && fsync(out_fd) != 0) {
+        g_set_error(error, NETPLAN_FILE_ERROR, errno, "%m");
+        ret = FALSE;
+    }
     close(out_fd);
     if (ret) {
-        if (rename(tmp_path, path) == 0)
+        if (rename(tmp_path, path) == 0) {
+            _netplan_fsync_dir(path);
             return TRUE;
+        }
         g_set_error(error, NETPLAN_FILE_ERROR, errno, "%m");
     }
     /* Something went wrong, clean up the tempfile! */
@@ -1263,13 +1323,33 @@ netplan_state_update_yaml_hierarchy(const NetplanState* np_state, const char* de
         const char *filename = key;
         gboolean is_fallback = (g_strcmp0(filename, default_path) == 0);
         GList* netdefs = value;
-        out_fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        /* Write to a temp file, fsync, then atomically rename into place, so an
+         * interrupted write can never leave a truncated/0-byte YAML behind. */
+        g_autofree gchar* tmp_path = g_strdup_printf("%s.XXXXXX", filename);
+        mode_t old_umask = umask(077);
+        out_fd = mkstemp(tmp_path); // permissions 0600 by default
+        umask(old_umask);
         if (out_fd < 0)
             goto file_error;
-        if (!netplan_netdef_list_write_yaml(np_state, netdefs, out_fd, filename, is_fallback, error))
+        if (!netplan_netdef_list_write_yaml(np_state, netdefs, out_fd, filename, is_fallback, error)) {
+            close(out_fd);
+            out_fd = -1;
+            unlink(tmp_path);
             goto cleanup; // LCOV_EXCL_LINE
+        }
+        if (fsync(out_fd) != 0) {
+            close(out_fd);
+            out_fd = -1;
+            unlink(tmp_path);
+            goto file_error;
+        }
         close(out_fd);
         out_fd = -1;
+        if (rename(tmp_path, filename) != 0) {
+            unlink(tmp_path);
+            goto file_error;
+        }
+        _netplan_fsync_dir(filename);
     }
 
     /* Remove any referenced source file that doesn't have any associated data.
