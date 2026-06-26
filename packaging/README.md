@@ -62,6 +62,16 @@ dch --local +atomic 'Atomic+durable /etc/netplan/*.yaml write (no 0-byte files)'
 DEB_BUILD_OPTIONS=nocheck dpkg-buildpackage -b -us -uc
 ```
 
+## Prebuilt apt repository (CI)
+
+`.github/workflows/deb.yml` builds this package for **all Debian trixie release
+architectures** (amd64, arm64, armhf, i386, ppc64el, riscv64, s390x — native
+where possible, QEMU-emulated otherwise via `packaging/ci-build.sh`) and
+publishes them as a single GPG-signed apt repository at
+<https://mithro.github.io/netplan/> on every push. See the repo's front page for
+copy-paste setup; the local `build-deb.py` above is only needed for an ad-hoc
+single-architecture build.
+
 ## Upstream
 
 This fix is intended for upstream `netplan` as well; once it lands and reaches

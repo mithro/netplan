@@ -1,10 +1,9 @@
 name: Debian Package + apt repo
 
-# Build a patched netplan.io (atomic+durable /etc/netplan/*.yaml write) and
-# publish it as a signed apt repository on GitHub Pages
-# (https://mithro.github.io/netplan/). Mirrors the pattern used by other
-# mithro apt-repo projects (e.g. dtbocfg), adapted for an arch-specific,
-# build-from-distro-source package.
+# Build a patched netplan.io (atomic+durable /etc/netplan/*.yaml write) for ALL
+# Debian release architectures and publish them as a single signed apt repository
+# on GitHub Pages (https://mithro.github.io/netplan/). Mirrors the pattern used
+# by other mithro apt-repo projects (e.g. dtbocfg).
 
 on:
   push:
@@ -13,60 +12,46 @@ on:
 
 jobs:
   build-deb:
-    # libnetplan is architecture-specific and the fleet (Raspberry Pi + Ten64)
-    # is arm64, so build natively on an arm64 runner inside a Debian trixie
-    # container (RPi OS trixie shares the same base library ABIs).
-    runs-on: ubuntu-24.04-arm
-    container: debian:trixie
+    name: build (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Native where possible, QEMU-emulated otherwise. arm64 uses the free
+          # arm64 runner (native); everything else builds on the amd64 runner
+          # (amd64/i386 native, the rest via QEMU).
+          - { arch: amd64,   runner: ubuntu-latest,    platform: linux/amd64 }
+          - { arch: i386,    runner: ubuntu-latest,    platform: linux/386 }
+          - { arch: arm64,   runner: ubuntu-24.04-arm, platform: linux/arm64 }
+          - { arch: armhf,   runner: ubuntu-latest,    platform: linux/arm/v7 }
+          - { arch: riscv64, runner: ubuntu-latest,    platform: linux/riscv64 }
+          - { arch: ppc64el, runner: ubuntu-latest,    platform: linux/ppc64le }
+          - { arch: s390x,   runner: ubuntu-latest,    platform: linux/s390x }
+    runs-on: ${{ matrix.runner }}
     steps:
-      - name: Install tooling + build dependencies
-        run: |
-          set -eux
-          # Enable deb-src on the container's existing Debian source so it
-          # inherits that source's signing keyring (avoids a Signed-By conflict).
-          sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/debian.sources
-          apt-get update
-          apt-get install -y --no-install-recommends \
-            ca-certificates git quilt devscripts dpkg-dev
-          apt-get build-dep -y netplan.io
-
       - uses: actions/checkout@v4
 
-      - name: Trust repo directory
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Set up QEMU (for foreign-architecture containers)
+        uses: docker/setup-qemu-action@v3
 
-      - name: Build patched netplan package
+      - name: Build ${{ matrix.arch }} package in debian:trixie
         run: |
-          set -eux
-          work="$(mktemp -d)"
-          cd "$work"
-          apt-get source netplan.io
-          src="$(ls -d netplan.io-*/)"
-          cd "$src"
-          # Apply the atomic+durable YAML-write fix as a quilt patch on top of
-          # the distribution's series.
-          cp "$GITHUB_WORKSPACE/packaging/atomic-durable-yaml-write.patch" debian/patches/
-          echo atomic-durable-yaml-write.patch >> debian/patches/series
-          QUILT_PATCHES=debian/patches quilt push -a
-          # Version: <distro version>+welland<run number>. Monotonic across runs
-          # and strictly greater than the distro's own +rpt1/-N revisions.
-          base="$(dpkg-parsechangelog -S Version)"
-          newver="${base}+welland${GITHUB_RUN_NUMBER}"
-          DEBEMAIL="me@mith.ro" DEBFULLNAME="Tim Ansell" \
-            dch -b -v "$newver" -D trixie \
-            "Atomic+durable /etc/netplan/*.yaml write (mkstemp+fsync+rename); prevents 0-byte files. CI build."
-          DEB_BUILD_OPTIONS=nocheck dpkg-buildpackage -b -us -uc
-          mkdir -p "$GITHUB_WORKSPACE/built-debs"
-          cp ../*.deb "$GITHUB_WORKSPACE/built-debs/"
-          ls -l "$GITHUB_WORKSPACE/built-debs/"
+          docker run --rm --platform=${{ matrix.platform }} \
+            -e GITHUB_RUN_NUMBER="${GITHUB_RUN_NUMBER}" \
+            -v "${PWD}:/src" -w /src \
+            docker.io/library/debian:trixie \
+            bash packaging/ci-build.sh
 
       - uses: actions/upload-artifact@v4
         with:
-          name: debs
+          name: debs-${{ matrix.arch }}
           path: built-debs/
 
   publish-apt:
     needs: build-deb
+    # Publish even if some architectures failed to build, as long as at least
+    # one produced artifacts.
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     permissions:
       pages: write
@@ -77,9 +62,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/download-artifact@v4
+      - name: Download all architecture artifacts
+        uses: actions/download-artifact@v4
         with:
-          name: debs
+          pattern: debs-*
+          merge-multiple: true
           path: apt-repo/
 
       - name: Generate apt repo metadata
@@ -96,7 +83,7 @@ jobs:
             echo "Label: netplan-welland"
             echo "Suite: stable"
             echo "Codename: trixie"
-            echo "Architectures: arm64"
+            echo "Architectures: amd64 arm64 armhf i386 ppc64el riscv64 s390x"
             echo "Components: main"
             echo "Description: Patched netplan.io (atomic+durable /etc/netplan write, no 0-byte files)"
           } > Release
