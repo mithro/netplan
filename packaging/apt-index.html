@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>netplan (welland patched) apt repository</title></head>
+<body>
+<h1>netplan (welland patched) apt repository</h1>
+<p>A rebuild of Debian's <code>netplan.io</code> with one crash-safety fix:
+<code>/etc/netplan/*.yaml</code> is written atomically and durably
+(<code>mkstemp</code> + <code>fsync</code> + <code>rename</code>) instead of an
+in-place truncate, so an interrupted boot (power loss, reboot, SIGKILL) can no
+longer leave a 0-byte YAML and break networking. Source:
+<a href="https://github.com/mithro/netplan/tree/welland-atomic-yaml-write">github.com/mithro/netplan</a>
+(branch <code>welland-atomic-yaml-write</code>).</p>
+
+<h2>Setup (Debian / Raspberry Pi OS trixie, arm64)</h2>
+<pre>
+sudo install -d -m0755 /etc/apt/keyrings
+curl -fsSL https://mithro.github.io/netplan/netplan.gpg \
+  | sudo tee /etc/apt/keyrings/netplan-welland.gpg > /dev/null
+
+echo "deb [signed-by=/etc/apt/keyrings/netplan-welland.gpg] https://mithro.github.io/netplan/ ./" \
+  | sudo tee /etc/apt/sources.list.d/netplan-welland.list
+
+sudo apt update
+sudo apt install libnetplan1 netplan.io netplan-generator python3-netplan
+</pre>
+</body>
+</html>

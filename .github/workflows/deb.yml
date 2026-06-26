@@ -1,0 +1,125 @@
+name: Debian Package + apt repo
+
+# Build a patched netplan.io (atomic+durable /etc/netplan/*.yaml write) and
+# publish it as a signed apt repository on GitHub Pages
+# (https://mithro.github.io/netplan/). Mirrors the pattern used by other
+# mithro apt-repo projects (e.g. dtbocfg), adapted for an arch-specific,
+# build-from-distro-source package.
+
+on:
+  push:
+    branches: [welland-atomic-yaml-write]
+  workflow_dispatch:
+
+jobs:
+  build-deb:
+    # libnetplan is architecture-specific and the fleet (Raspberry Pi + Ten64)
+    # is arm64, so build natively on an arm64 runner inside a Debian trixie
+    # container (RPi OS trixie shares the same base library ABIs).
+    runs-on: ubuntu-24.04-arm
+    container: debian:trixie
+    steps:
+      - name: Install tooling + build dependencies
+        run: |
+          set -eux
+          printf 'Types: deb-src\nURIs: http://deb.debian.org/debian\nSuites: trixie\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.gpg\n' \
+            > /etc/apt/sources.list.d/debian-src.sources
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates git quilt devscripts dpkg-dev
+          apt-get build-dep -y netplan.io
+
+      - uses: actions/checkout@v4
+
+      - name: Trust repo directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Build patched netplan package
+        run: |
+          set -eux
+          work="$(mktemp -d)"
+          cd "$work"
+          apt-get source netplan.io
+          src="$(ls -d netplan.io-*/)"
+          cd "$src"
+          # Apply the atomic+durable YAML-write fix as a quilt patch on top of
+          # the distribution's series.
+          cp "$GITHUB_WORKSPACE/packaging/atomic-durable-yaml-write.patch" debian/patches/
+          echo atomic-durable-yaml-write.patch >> debian/patches/series
+          QUILT_PATCHES=debian/patches quilt push -a
+          # Version: <distro version>+welland<run number>. Monotonic across runs
+          # and strictly greater than the distro's own +rpt1/-N revisions.
+          base="$(dpkg-parsechangelog -S Version)"
+          newver="${base}+welland${GITHUB_RUN_NUMBER}"
+          DEBEMAIL="me@mith.ro" DEBFULLNAME="Tim Ansell" \
+            dch -b -v "$newver" -D trixie \
+            "Atomic+durable /etc/netplan/*.yaml write (mkstemp+fsync+rename); prevents 0-byte files. CI build."
+          DEB_BUILD_OPTIONS=nocheck dpkg-buildpackage -b -us -uc
+          mkdir -p "$GITHUB_WORKSPACE/built-debs"
+          cp ../*.deb "$GITHUB_WORKSPACE/built-debs/"
+          ls -l "$GITHUB_WORKSPACE/built-debs/"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: debs
+          path: built-debs/
+
+  publish-apt:
+    needs: build-deb
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: debs
+          path: apt-repo/
+
+      - name: Generate apt repo metadata
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends dpkg-dev apt-utils
+          cp packaging/apt-index.html apt-repo/index.html
+          cd apt-repo
+          dpkg-scanpackages --multiversion . > Packages
+          gzip -k -f Packages
+          {
+            echo "Origin: netplan-welland"
+            echo "Label: netplan-welland"
+            echo "Suite: stable"
+            echo "Codename: trixie"
+            echo "Architectures: arm64"
+            echo "Components: main"
+            echo "Description: Patched netplan.io (atomic+durable /etc/netplan write, no 0-byte files)"
+          } > Release
+          apt-ftparchive release . >> Release
+
+      - name: Sign repo
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+        if: env.GPG_PRIVATE_KEY != ''
+        run: |
+          set -eux
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          cd apt-repo
+          gpg --batch --yes --armor --detach-sign --output Release.gpg Release
+          gpg --batch --yes --armor --clearsign --output InRelease Release
+          gpg --batch --yes --armor --export > netplan.gpg
+
+      - uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: apt-repo/
+
+      - id: deploy
+        uses: actions/deploy-pages@v4
