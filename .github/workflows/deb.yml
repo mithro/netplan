@@ -22,8 +22,9 @@ jobs:
       - name: Install tooling + build dependencies
         run: |
           set -eux
-          printf 'Types: deb-src\nURIs: http://deb.debian.org/debian\nSuites: trixie\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.gpg\n' \
-            > /etc/apt/sources.list.d/debian-src.sources
+          # Enable deb-src on the container's existing Debian source so it
+          # inherits that source's signing keyring (avoids a Signed-By conflict).
+          sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/debian.sources
           apt-get update
           apt-get install -y --no-install-recommends \
             ca-certificates git quilt devscripts dpkg-dev
