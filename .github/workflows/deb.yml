@@ -1,9 +1,13 @@
-name: Debian Package + apt repo
+name: Debian + Raspbian apt repos
 
-# Build a patched netplan.io (atomic+durable /etc/netplan/*.yaml write) for ALL
-# Debian release architectures and publish them as a single signed apt repository
-# on GitHub Pages (https://mithro.github.io/netplan/). Mirrors the pattern used
-# by other mithro apt-repo projects (e.g. dtbocfg).
+# Build the patched netplan.io (atomic+durable /etc/netplan/*.yaml write) and
+# publish TWO signed apt repos on one GitHub Pages site:
+#   https://mithro.github.io/netplan/debian/    — stock Debian trixie (7 arches)
+#   https://mithro.github.io/netplan/raspbian/  — Raspberry Pi OS / Raspbian trixie
+#                                                 (armhf=ARMv6 for Pi 1/Zero + arm64)
+# RPi OS 64-bit shares Debian's arm64 base, so the arm64 build is reused in both
+# repos; the distinct Raspbian build is armhf(ARMv6), which Debian's armhf (ARMv7)
+# cannot provide — it is bootstrapped from raspbian.raspberrypi.com via mmdebstrap.
 
 on:
   push:
@@ -11,15 +15,12 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-deb:
-    name: build (${{ matrix.arch }})
+  build-debian:
+    name: debian (${{ matrix.arch }})
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Native where possible, QEMU-emulated otherwise. arm64 uses the free
-          # arm64 runner (native); everything else builds on the amd64 runner
-          # (amd64/i386 native, the rest via QEMU).
           - { arch: amd64,   runner: ubuntu-latest,    platform: linux/amd64 }
           - { arch: i386,    runner: ubuntu-latest,    platform: linux/386 }
           - { arch: arm64,   runner: ubuntu-24.04-arm, platform: linux/arm64 }
@@ -30,10 +31,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-
       - name: Set up QEMU (for foreign-architecture containers)
         uses: docker/setup-qemu-action@v3
-
       - name: Build ${{ matrix.arch }} package in debian:trixie
         run: |
           docker run --rm --platform=${{ matrix.platform }} \
@@ -41,16 +40,39 @@ jobs:
             -v "${PWD}:/src" -w /src \
             docker.io/library/debian:trixie \
             bash packaging/ci-build.sh
-
       - uses: actions/upload-artifact@v4
         with:
-          name: debs-${{ matrix.arch }}
+          name: debs-debian-${{ matrix.arch }}
           path: built-debs/
 
-  publish-apt:
-    needs: build-deb
-    # Publish even if some architectures failed to build, as long as at least
-    # one produced artifacts.
+  build-raspbian:
+    name: raspbian (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Separate from the Debian builds: each is bootstrapped in its own
+          # Raspbian/RPi-OS rootfs. armhf=ARMv6 (Pi 1/Zero) is QEMU-emulated on the
+          # amd64 runner; arm64 (RPi OS 64-bit) builds natively on the arm64 runner.
+          - { arch: armhf, runner: ubuntu-latest }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up QEMU (binfmt for the foreign-arch chroot)
+        uses: docker/setup-qemu-action@v3
+      - name: Bootstrap Raspbian ${{ matrix.arch }} rootfs + build
+        run: sudo -E env RPI_ARCH=${{ matrix.arch }} bash packaging/ci-build-raspbian.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: debs-raspbian-${{ matrix.arch }}
+          path: built-debs/
+
+  publish:
+    needs: [build-debian, build-raspbian]
+    # Publish even if a build job failed, as long as at least the Debian arches
+    # produced artifacts (the ARMv6 build is the most fragile; don't let it block
+    # the rest).
     if: ${{ always() }}
     runs-on: ubuntu-latest
     permissions:
@@ -62,50 +84,64 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download all architecture artifacts
+      - name: Download all build artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: debs-*
-          merge-multiple: true
-          path: apt-repo/
+          path: dl
 
-      - name: Generate apt repo metadata
+      - name: Assemble + sign the debian and raspbian repos
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
         run: |
           set -eux
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends dpkg-dev apt-utils
-          cp packaging/apt-index.html apt-repo/index.html
-          cd apt-repo
-          dpkg-scanpackages --multiversion . > Packages
-          gzip -k -f Packages
-          {
-            echo "Origin: netplan-welland"
-            echo "Label: netplan-welland"
-            echo "Suite: stable"
-            echo "Codename: trixie"
-            echo "Architectures: amd64 arm64 armhf i386 ppc64el riscv64 s390x"
-            echo "Components: main"
-            echo "Description: Patched netplan.io (atomic+durable /etc/netplan write, no 0-byte files)"
-          } > Release
-          apt-ftparchive release . >> Release
-
-      - name: Sign repo
-        env:
-          GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
-        if: env.GPG_PRIVATE_KEY != ''
-        run: |
-          set -eux
           echo "$GPG_PRIVATE_KEY" | gpg --batch --import
-          cd apt-repo
-          gpg --batch --yes --armor --detach-sign --output Release.gpg Release
-          gpg --batch --yes --armor --clearsign --output InRelease Release
-          gpg --batch --yes --armor --export > netplan.gpg
+
+          mkdir -p apt-repo/debian apt-repo/raspbian
+
+          # Debian repo: every Debian arch.
+          cp dl/debs-debian-*/*.deb apt-repo/debian/
+
+          # Raspbian repo: its OWN arm64 + armhf(ARMv6) builds (kept separate from
+          # the Debian arm64 build), whichever succeeded this run.
+          for a in arm64 armhf; do
+            if compgen -G "dl/debs-raspbian-$a/*.deb" > /dev/null; then
+              cp dl/debs-raspbian-$a/*.deb apt-repo/raspbian/
+            else
+              echo "WARNING: raspbian $a build produced no artifact this run"
+            fi
+          done
+
+          cp packaging/apt-index.html apt-repo/index.html
+
+          sign_repo() {
+            repo="$1"; arches="$2"; desc="$3"
+            ( cd "apt-repo/$repo"
+              dpkg-scanpackages --multiversion . > Packages
+              gzip -k -f Packages
+              {
+                echo "Origin: netplan-welland"
+                echo "Label: netplan-welland-$repo"
+                echo "Suite: stable"
+                echo "Codename: trixie"
+                echo "Architectures: $arches"
+                echo "Components: main"
+                echo "Description: $desc"
+              } > Release
+              apt-ftparchive release . >> Release
+              gpg --batch --yes --armor --detach-sign --output Release.gpg Release
+              gpg --batch --yes --armor --clearsign --output InRelease Release
+              gpg --batch --yes --armor --export > netplan.gpg )
+          }
+          sign_repo debian "amd64 arm64 armhf i386 ppc64el riscv64 s390x" \
+            "Patched netplan.io for Debian trixie (atomic+durable /etc/netplan write)"
+          sign_repo raspbian "armhf arm64" \
+            "Patched netplan.io for Raspberry Pi OS / Raspbian trixie (atomic+durable /etc/netplan write)"
 
       - uses: actions/configure-pages@v5
-
       - uses: actions/upload-pages-artifact@v3
         with:
           path: apt-repo/
-
       - id: deploy
         uses: actions/deploy-pages@v4
