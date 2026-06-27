@@ -29,11 +29,17 @@ case "$RPI_ARCH" in
     BASE_URL=http://raspbian.raspberrypi.com/raspbian
     BASE_COMP="main contrib non-free rpi firmware"
     curl -fsSL http://raspbian.raspberrypi.com/raspbian.public.key | gpg --dearmor > "$tmpk/base.gpg"
+    # The Raspbian archive key has a SHA1 self-binding signature that trixie's
+    # apt (sqv) rejects, so the in-rootfs apt trusts this archive without sig
+    # verification (build-time only; the published deb is signed by our key).
+    BASE_OPTS="[trusted=yes]"
     ;;
   arm64)
     BASE_URL=http://deb.debian.org/debian
     BASE_COMP="main"
     cp /usr/share/keyrings/debian-archive-keyring.gpg "$tmpk/base.gpg"
+    # Debian's archive key is modern — keep this source cryptographically verified.
+    BASE_OPTS="[signed-by=$KEYRING]"
     ;;
   *) echo "unknown RPI_ARCH=$RPI_ARCH" >&2; exit 1 ;;
 esac
@@ -53,10 +59,12 @@ mmdebstrap \
 # verified by the combined keyring (copied into the rootfs).
 install -D "$KEYRING" "$ROOT$KEYRING"
 rm -f "$ROOT"/etc/apt/sources.list.d/*.list "$ROOT"/etc/apt/sources.list.d/*.sources || true
+# Base verified per-arch (Debian: signed-by; Raspbian: trusted, SHA1 key). The
+# RPi OS overlay key is also SHA1-rejected by trixie apt, so trust it too.
 cat > "$ROOT/etc/apt/sources.list" <<EOF
-deb [signed-by=$KEYRING] $BASE_URL trixie $BASE_COMP
-deb-src [signed-by=$KEYRING] $BASE_URL trixie $BASE_COMP
-deb [signed-by=$KEYRING] $OVERLAY_URL trixie $OVERLAY_COMP
+deb $BASE_OPTS $BASE_URL trixie $BASE_COMP
+deb-src $BASE_OPTS $BASE_URL trixie $BASE_COMP
+deb [trusted=yes] $OVERLAY_URL trixie $OVERLAY_COMP
 EOF
 
 cp /etc/resolv.conf "$ROOT/etc/resolv.conf"
