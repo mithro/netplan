@@ -1,10 +1,11 @@
 name: Debian + Raspbian apt repos
 
 # Build the patched netplan.io (atomic+durable /etc/netplan/*.yaml write) and
-# publish TWO signed apt repos on one GitHub Pages site:
-#   https://mithro.github.io/netplan/debian/    — stock Debian trixie (7 arches)
-#   https://mithro.github.io/netplan/raspbian/  — Raspberry Pi OS / Raspbian trixie
-#                                                 (armhf=ARMv6 for Pi 1/Zero + arm64)
+# publish one signed flat apt repository per suite on one GitHub Pages site,
+# through the shared workflow (docs/conventions.md in mithro/apt-repo-action):
+#   https://mith.ro/netplan/trixie/           — stock Debian trixie (7 arches)
+#   https://mith.ro/netplan/raspbian-trixie/  — Raspberry Pi OS / Raspbian trixie
+#                                               (armhf=ARMv6 for Pi 1/Zero + arm64)
 # RPi OS 64-bit shares Debian's arm64 base, so the arm64 build is reused in both
 # repos; the distinct Raspbian build is armhf(ARMv6), which Debian's armhf (ARMv7)
 # cannot provide — it is bootstrapped from raspbian.raspberrypi.com via mmdebstrap.
@@ -42,7 +43,7 @@ jobs:
             bash packaging/ci-build.sh
       - uses: actions/upload-artifact@v4
         with:
-          name: debs-debian-${{ matrix.arch }}
+          name: debs-trixie-${{ matrix.arch }}
           path: built-debs/
 
   build-raspbian:
@@ -65,106 +66,27 @@ jobs:
         run: sudo -E env RPI_ARCH=${{ matrix.arch }} bash packaging/ci-build-raspbian.sh
       - uses: actions/upload-artifact@v4
         with:
-          name: debs-raspbian-${{ matrix.arch }}
+          name: debs-raspbian-trixie-${{ matrix.arch }}
           path: built-debs/
 
   publish:
     needs: [build-debian, build-raspbian]
-    # Publish even if a build job failed, as long as at least the Debian arches
-    # produced artifacts (the ARMv6 build is the most fragile; don't let it block
-    # the rest).
-    if: ${{ always() }}
-    runs-on: ubuntu-latest
+    # Publish even if a build job failed, as long as each suite still has
+    # packages (the ARMv6 build is the most fragile; don't let it block the
+    # rest). Never from a pull request.
+    if: ${{ !cancelled() && github.event_name != 'pull_request' }}
     permissions:
+      contents: read
       pages: write
       id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download all build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: dl
-
-      - name: Assemble + sign the debian and raspbian repos
-        env:
-          GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
-        run: |
-          set -eux
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends dpkg-dev apt-utils
-          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
-
-          mkdir -p apt-repo/debian apt-repo/raspbian
-
-          # Debian repo: every Debian arch.
-          cp dl/debs-debian-*/*.deb apt-repo/debian/
-
-          # Raspbian repo: its OWN arm64 + armhf(ARMv6) builds (kept separate from
-          # the Debian arm64 build), whichever succeeded this run.
-          for a in arm64 armhf; do
-            if compgen -G "dl/debs-raspbian-$a/*.deb" > /dev/null; then
-              cp dl/debs-raspbian-$a/*.deb apt-repo/raspbian/
-            else
-              echo "WARNING: raspbian $a build produced no artifact this run"
-            fi
-          done
-
-          cp packaging/apt-index.html apt-repo/index.html
-
-          sign_repo() {
-            repo="$1"; arches="$2"; desc="$3"
-            ( cd "apt-repo/$repo"
-              dpkg-scanpackages --multiversion . > Packages
-              gzip -k -f Packages
-              {
-                echo "Origin: netplan-welland"
-                echo "Label: netplan-welland-$repo"
-                echo "Suite: stable"
-                echo "Codename: trixie"
-                echo "Architectures: $arches"
-                echo "Components: main"
-                echo "Description: $desc"
-              } > Release
-              apt-ftparchive release . >> Release
-              gpg --batch --yes --armor --detach-sign --output Release.gpg Release
-              gpg --batch --yes --armor --clearsign --output InRelease Release
-              # apt reads a keyring's format from its extension: .gpg must be
-              # binary, .asc armoured. An armoured .gpg is invisible on trixie
-              # (sqv reads both) but gpgv rejects it and the repo reads as
-              # unsigned. Publish both, each under the extension apt expects.
-              gpg --batch --yes --export > netplan.gpg
-              gpg --batch --yes --armor --export > netplan.asc )
-          }
-          sign_repo debian "amd64 arm64 armhf i386 ppc64el riscv64 s390x" \
-            "Patched netplan.io for Debian trixie (atomic+durable /etc/netplan write)"
-          sign_repo raspbian "armhf arm64" \
-            "Patched netplan.io for Raspberry Pi OS / Raspbian trixie (atomic+durable /etc/netplan write)"
-
-          # Both repos are signed by the same key; also serve it at the site
-          # root so the key can be found without knowing the repo layout.
-          cp apt-repo/debian/netplan.gpg apt-repo/debian/netplan.asc apt-repo/
-
-      - name: Fetch the keyring checker
-        uses: actions/checkout@v4
-        with:
-          repository: mithro/apt-repo-action
-          path: .apt-repo-action
-
-      - name: Verify each keyring matches the format its extension promises
-        run: |
-          set -eu
-          for d in apt-repo apt-repo/debian apt-repo/raspbian; do
-            python3 .apt-repo-action/scripts/check-keyrings.py \
-              --binary "$d/netplan.gpg" --armored "$d/netplan.asc"
-          done
-
-      - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v3
-        with:
-          path: apt-repo/
-      - id: deploy
-        uses: actions/deploy-pages@v4
+    uses: mithro/apt-repo-action/.github/workflows/publish-apt.yml@main
+    with:
+      suites: "trixie raspbian-trixie"
+      architectures: "amd64 arm64 armhf i386 ppc64el riscv64 s390x"
+      description: "Patched netplan.io (atomic+durable /etc/netplan write)"
+      # Transitional: the previous debian/ and raspbian/ repositories (Origin
+      # netplan-welland), frozen, until every client points at <site>/trixie/
+      # or <site>/raspbian-trixie/ and pins o=netplan.
+      legacy-paths: "debian raspbian"
+    secrets:
+      gpg-private-key: ${{ secrets.APT_GPG_PRIVATE_KEY }}
