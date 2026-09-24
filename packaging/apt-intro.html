@@ -1,0 +1,15 @@
+<p>A rebuild of <code>netplan.io</code> with one crash-safety fix:
+<code>/etc/netplan/*.yaml</code> is written atomically and durably
+(<code>mkstemp</code> + <code>fsync</code> + <code>rename</code>) instead of an
+in-place truncate, so an interrupted boot (power loss, reboot, SIGKILL) can no
+longer leave a 0-byte YAML and break networking. Install
+<code>libnetplan1 netplan.io netplan-generator python3-netplan</code>.</p>
+
+<p><b>Use the suite that matches the OS actually installed.</b>
+<code>trixie</code> is stock Debian (amd64, arm64, armhf (ARMv7), i386, ppc64el,
+riscv64, s390x). <code>raspbian-trixie</code> is Raspberry Pi OS / Raspbian:
+arm64 (RPi OS 64-bit) and armhf built as ARMv6 hard-float for the Pi 1 / Zero /
+Zero W, which Debian's ARMv7 armhf cannot provide.</p>
+
+<p>To keep these builds ahead of a newer upstream netplan.io, pin the origin:
+<code>Pin: release o=netplan</code>, <code>Pin-Priority: 1001</code>.</p>
