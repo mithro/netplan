@@ -84,13 +84,5 @@ jobs:
       suites: "trixie raspbian-trixie"
       architectures: "amd64 arm64 armhf i386 ppc64el riscv64 s390x"
       description: "Patched netplan.io (atomic+durable /etc/netplan write)"
-      # Transitional: the previous debian/ and raspbian/ repositories (Origin
-      # netplan-welland), frozen, until every client points at <site>/trixie/
-      # or <site>/raspbian-trixie/ and pins o=netplan. The old layout also
-      # served the (same) key inside each directory.
-      legacy-paths: >-
-        debian raspbian
-        debian/netplan.gpg=netplan.gpg debian/netplan.asc=netplan.asc
-        raspbian/netplan.gpg=netplan.gpg raspbian/netplan.asc=netplan.asc
     secrets:
       gpg-private-key: ${{ secrets.APT_GPG_PRIVATE_KEY }}
