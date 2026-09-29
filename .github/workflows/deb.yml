@@ -12,7 +12,7 @@ name: Debian + Raspbian apt repos
 
 on:
   push:
-    branches: [welland-atomic-yaml-write]
+    branches: [packaging]
   workflow_dispatch:
 
 jobs:
